@@ -8,14 +8,13 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.nio.file.{FileSystems, Files, Path}
 import java.util.concurrent.ConcurrentHashMap
 import java.util.stream.Collectors
-
 import bloop.io.Environment.lineSeparator
 import bloop.io.ServerHandle
 import bloop.util.JavaRuntime
 import bloop.bsp.BloopBspDefinitions.BloopExtraBuildParams
 import bloop.{CompileMode, Compiler, ScalaInstance}
 import bloop.cli.{Commands, ExitStatus, Validate}
-import bloop.dap.{DebugServer, DebuggeeRunner, StartedDebugServer}
+import bloop.dap.{DebugServerLogger, BloopDebuggeeRunner}
 import bloop.data.{ClientInfo, JdkConfig, Platform, Project, WorkspaceSettings}
 import bloop.engine.{Aggregate, Dag, Interpreter, State}
 import bloop.engine.tasks.{CompileTask, RunMode, Tasks, TestTask}
@@ -33,16 +32,15 @@ import ch.epfl.scala.bsp.{
   JvmEnvironmentItem,
   MessageType,
   ShowMessageParams,
+  Uri,
   endpoints
 }
-
 import scala.meta.jsonrpc.{JsonRpcClient, Response => JsonRpcResponse, Services => JsonRpcServices}
 import monix.eval.Task
 import monix.reactive.Observer
 import monix.execution.Scheduler
 import monix.execution.atomic.AtomicInt
 import monix.execution.atomic.AtomicBoolean
-
 import scala.collection.concurrent.TrieMap
 import scala.collection.mutable
 import scala.collection.JavaConverters._
@@ -58,6 +56,7 @@ import bloop.data.ClientInfo.BspClientInfo
 import bloop.exec.Forker
 import bloop.logging.BloopLogger
 import bloop.config.Config
+import ch.epfl.scala.debugadapter.{DebugServer, DebuggeeRunner}
 
 final class BloopBspServices(
     callSiteState: State,
@@ -92,7 +91,7 @@ final class BloopBspServices(
     Task.fork(t, computationScheduler).asyncBoundary(ioScheduler)
   }
 
-  private val backgroundDebugServers = TrieMap.empty[StartedDebugServer, Cancelable]
+  private val backgroundDebugServers = TrieMap.empty[URI, Cancelable]
 
   // Disable ansi codes for now so that the BSP clients don't get unescaped color codes
   private val taskIdCounter: AtomicInt = AtomicInt(0)
@@ -108,6 +107,7 @@ final class BloopBspServices(
     .requestAsync(endpoints.BuildTarget.sources)(p => schedule(sources(p)))
     .requestAsync(endpoints.BuildTarget.resources)(p => schedule(resources(p)))
     .requestAsync(endpoints.BuildTarget.scalacOptions)(p => schedule(scalacOptions(p)))
+    .requestAsync(endpoints.BuildTarget.javacOptions)(p => schedule(javacOptions(p)))
     .requestAsync(endpoints.BuildTarget.compile)(p => schedule(compile(p)))
     .requestAsync(endpoints.BuildTarget.test)(p => schedule(test(p)))
     .requestAsync(endpoints.BuildTarget.run)(p => schedule(run(p)))
@@ -585,11 +585,15 @@ final class BloopBspServices(
 
       params.dataKind match {
         case bsp.DebugSessionParamsDataKind.ScalaMainClass =>
-          convert[bsp.ScalaMainClass](main => DebuggeeRunner.forMainClass(projects, main, state))
+          convert[bsp.ScalaMainClass](
+            main => BloopDebuggeeRunner.forMainClass(projects, main, state, ioScheduler)
+          )
         case bsp.DebugSessionParamsDataKind.ScalaTestSuites =>
-          convert[List[String]](filters => DebuggeeRunner.forTestSuite(projects, filters, state))
+          convert[List[String]](
+            filters => BloopDebuggeeRunner.forTestSuite(projects, filters, state, ioScheduler)
+          )
         case bsp.DebugSessionParamsDataKind.ScalaAttachRemote =>
-          Right(DebuggeeRunner.forAttachRemote(state))
+          Right(BloopDebuggeeRunner.forAttachRemote(state, ioScheduler))
         case dataKind => Left(JsonRpcResponse.invalidRequest(s"Unsupported data kind: $dataKind"))
       }
     }
@@ -622,17 +626,14 @@ final class BloopBspServices(
                   val projects = mappings.map(_._2)
                   inferDebuggeeRunner(projects, state) match {
                     case Right(runner) =>
-                      val startedServer = DebugServer.start(runner, logger, ioScheduler)
-                      val listenAndUnsubscribe = startedServer.listen
-                        .runOnComplete(_ => backgroundDebugServers -= startedServer)(ioScheduler)
-                      backgroundDebugServers += startedServer -> listenAndUnsubscribe
-
-                      startedServer.address.map {
-                        case Some(uri) => (state, Right(new bsp.DebugSessionAddress(uri.toString)))
-                        case None =>
-                          val error = JsonRpcResponse.internalError("Failed to start debug server")
-                          (state, Left(error))
-                      }
+                      val dapLogger = new DebugServerLogger(logger)
+                      val handler =
+                        DebugServer.start(runner, dapLogger, autoCloseSession = true)(ioScheduler)
+                      val listenAndUnsubscribe = Task
+                        .fromFuture(handler.running)
+                        .runOnComplete(_ => backgroundDebugServers -= handler.uri)(ioScheduler)
+                      backgroundDebugServers += handler.uri -> listenAndUnsubscribe
+                      Task.now((state, Right(new bsp.DebugSessionAddress(handler.uri.toString))))
 
                     case Left(error) =>
                       Task.now((state, Left(error)))
@@ -1118,6 +1119,19 @@ final class BloopBspServices(
     }
   }
 
+  private def getClasspath(state: State, project: Project): List[Uri] = {
+    val uris = mutable.Map.empty[Path, bsp.Uri]
+    val dag = state.build.getDagFor(project)
+    val fullClasspath = project.fullClasspath(dag, state.client)
+    val classpath =
+      fullClasspath.map(e => uris.getOrElseUpdate(e.underlying, bsp.Uri(e.toBspUri))).toList
+    classpath
+  }
+
+  private def getClassesDir(state: State, project: Project): bsp.Uri = {
+    bsp.Uri(state.client.getUniqueClassesDirFor(project, forceGeneration = true).toBspUri)
+  }
+
   def scalacOptions(
       request: bsp.ScalacOptionsParams
   ): BspEndpointResponse[bsp.ScalacOptionsResult] = {
@@ -1125,25 +1139,19 @@ final class BloopBspServices(
         projects: Seq[ProjectMapping],
         state: State
     ): BspResult[bsp.ScalacOptionsResult] = {
-      val uris = mutable.Map.empty[Path, bsp.Uri]
       val response = bsp.ScalacOptionsResult(
         projects.iterator.map {
           case (target, project) =>
-            val dag = state.build.getDagFor(project)
-            val fullClasspath = project.fullClasspath(dag, state.client)
-            val classpath =
-              fullClasspath.map(e => uris.getOrElseUpdate(e.underlying, bsp.Uri(e.toBspUri))).toList
-            val classesDir =
-              state.client.getUniqueClassesDirFor(project, forceGeneration = true).toBspUri
+            val classpath = getClasspath(state, project)
+            val classesDir = getClassesDir(state, project)
             bsp.ScalacOptionsItem(
               target = target,
               options = project.scalacOptions.toList,
               classpath = classpath,
-              classDirectory = bsp.Uri(classesDir)
+              classDirectory = classesDir
             )
         }.toList
       )
-
       Task.now((state, Right(response)))
     }
 
@@ -1152,9 +1160,42 @@ final class BloopBspServices(
         case Left(error) =>
           // Log the mapping error to the user via a log event + an error status code
           logger.error(error)
-          // TODO(jvican): Add status code to scalac options result
           Task.now((state, Right(bsp.ScalacOptionsResult(Nil))))
         case Right(mappings) => scalacOptions(mappings, state)
+      }
+    }
+  }
+
+  def javacOptions(
+      request: bsp.JavacOptionsParams
+  ): BspEndpointResponse[bsp.JavacOptionsResult] = {
+    def javacOptions(
+        projects: Seq[ProjectMapping],
+        state: State
+    ): BspResult[bsp.JavacOptionsResult] = {
+      val response = bsp.JavacOptionsResult(
+        projects.iterator.map {
+          case (target, project) =>
+            val classpath = getClasspath(state, project)
+            val classesDir = getClassesDir(state, project)
+            bsp.JavacOptionsItem(
+              target = target,
+              options = project.javacOptions.toList,
+              classpath = classpath,
+              classDirectory = classesDir
+            )
+        }.toList
+      )
+      Task.now((state, Right(response)))
+    }
+
+    ifInitialized(None) { (state: State, logger: BspServerLogger) =>
+      mapToProjects(request.targets, state) match {
+        case Left(error) =>
+          // Log the mapping error to the user via a log event + an error status code
+          logger.error(error)
+          Task.now((state, Right(bsp.JavacOptionsResult(Nil))))
+        case Right(mappings) => javacOptions(mappings, state)
       }
     }
   }

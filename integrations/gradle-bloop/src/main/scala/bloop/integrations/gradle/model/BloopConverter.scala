@@ -9,6 +9,7 @@ import bloop.config.{Config, Tag}
 import bloop.config.Config.{CompileSetup, JavaThenScala, JvmConfig, Mixed, Platform}
 import bloop.integrations.gradle.BloopParameters
 import bloop.integrations.gradle.syntax._
+import bloop.integrations.gradle.tasks.PluginUtils
 import org.gradle.api.{Action, GradleException, Project}
 import org.gradle.api.artifacts._
 import org.gradle.api.artifacts.ArtifactView.ViewConfiguration
@@ -35,6 +36,7 @@ import org.gradle.plugins.ide.internal.tooling.java.DefaultInstalledJdk
 import scala.collection.JavaConverters._
 import scala.util.{Failure, Success, Try}
 import scala.io.Source
+import scala.annotation.tailrec
 
 /**
  * Define the conversion from Gradle's project model to Bloop's project model.
@@ -69,9 +71,11 @@ class BloopConverter(parameters: BloopParameters) {
 
     // Gradle always creates a main and test source set regardless of whether they are needed.
     // ignore test sourceset if there are no sources or resources
-    if (isTestSourceSet &&
-        !sources.exists(_.toFile.exists()) &&
-        !resources.exists(_.toFile.exists())) {
+    if (
+      isTestSourceSet &&
+      !sources.exists(_.toFile.exists()) &&
+      !resources.exists(_.toFile.exists())
+    ) {
       Failure(new GradleException("Test project has no source so ignore it"))
     } else {
       // get Gradle output dirs
@@ -96,10 +100,9 @@ class BloopConverter(parameters: BloopParameters) {
 
       // create map of every projects' output dirs -> source sets
       val allOutputDirsToSourceSets = allSourceSetsToProjects.keySet
-        .flatMap(
-          ss =>
-            ss.getOutput.getClassesDirs.getFiles.asScala.map(_ -> ss) +
-              (ss.getOutput.getResourcesDir -> ss)
+        .flatMap(ss =>
+          ss.getOutput.getClassesDirs.getFiles.asScala.map(_ -> ss) +
+            (ss.getOutput.getResourcesDir -> ss)
         )
         .toMap
 
@@ -148,6 +151,7 @@ class BloopConverter(parameters: BloopParameters) {
 
             val DottyVersion = raw"""0\.(\d+)(.*)""".r
             val Scala3Version = raw"""3\.(\d+)\.(\d+)-(\w+)(.*)""".r
+            val Scala3VersionReleased = raw"""3\.(\d+)(.*)""".r
             val (dottyOrgName, dottyLibrary, artifactAndVersion) = version match {
               case DottyVersion(minor, patch) =>
                 val artifactID = s"dotty-compiler_0.$minor"
@@ -158,6 +162,12 @@ class BloopConverter(parameters: BloopParameters) {
                 val artifactVersion =
                   if (remaining.isEmpty) "+" else s"3.$minor.$patch-$milestone$remaining"
                 ("org.scala-lang", "SCALA3-LIBRARY", s"$artifactID:$artifactVersion")
+              case Scala3VersionReleased(minor, patch) =>
+                val artifactID = s"scala3-compiler_3"
+                val artifactVersion = if (patch.isEmpty) "+" else s"3.$minor$patch"
+                ("org.scala-lang", "SCALA3-LIBRARY", s"$artifactID:$artifactVersion")
+              case "3" =>
+                ("org.scala-lang", "SCALA3-LIBRARY", s"scala3-compiler_3:+")
             }
 
             val compilerDependencyName = s"$dottyOrgName:$artifactAndVersion"
@@ -193,20 +203,18 @@ class BloopConverter(parameters: BloopParameters) {
       // filter out internal scala plugin configurations
       val additionalModules = project.getConfigurations.asScala
         .filter(_.isCanBeResolved)
-        .filter(
-          c =>
-            !List(
-              "incrementalScalaAnalysisElements",
-              "incrementalScalaAnalysisFormain",
-              "incrementalScalaAnalysisFortest",
-              "zinc"
-            ).contains(c.getName)
+        .filter(c =>
+          !List(
+            "incrementalScalaAnalysisElements",
+            "incrementalScalaAnalysisFormain",
+            "incrementalScalaAnalysisFortest",
+            "zinc"
+          ).contains(c.getName)
         )
         .flatMap(getConfigurationArtifacts)
-        .filter(
-          f =>
-            !allArchivesToSourceSets.contains(f.getFile) &&
-              !allOutputDirsToSourceSets.contains(f.getFile)
+        .filter(f =>
+          !allArchivesToSourceSets.contains(f.getFile) &&
+            !allOutputDirsToSourceSets.contains(f.getFile)
         )
         .map(artifactToConfigModule(_, project))
         .toList
@@ -252,7 +260,7 @@ class BloopConverter(parameters: BloopParameters) {
         bloopProject = Config.Project(
           name = projectName,
           directory = project.getProjectDir.toPath,
-          workspaceDir = Option(project.getRootProject.getProjectDir.toPath),
+          workspaceDir = Option(project.getRootProject.workspacePath),
           sources = sources,
           sourcesGlobs = None,
           sourceRoots = None,
@@ -305,13 +313,13 @@ class BloopConverter(parameters: BloopParameters) {
       targetDir: File
   ): List[Path] = {
     classPathFiles
-      .map(f => {
+      .flatMap(f => {
         // change Gradle JAR references -> Bloop project classes dirs where possible.
         allArchivesToSourceSets
           .get(f)
           .map(ss => {
             val ssProject = allSourceSetsToProjects(ss)
-            getClassesDir(targetDir, ssProject, ss)
+            getClassesDir(targetDir, ssProject, ss) :: getResources(ss)
           })
           .orElse(
             // change Gradle classes dirs -> Bloop project classes dirs where possible.
@@ -319,16 +327,16 @@ class BloopConverter(parameters: BloopParameters) {
               .get(f)
               .map(ss => {
                 val ssProject = allSourceSetsToProjects(ss)
-                getClassesDir(targetDir, ssProject, ss)
+                getClassesDir(targetDir, ssProject, ss) :: getResources(ss)
               })
           )
-          .getOrElse(f.toPath)
+          .getOrElse(List(f.toPath))
       })
       .distinct
   }
 
   private def getSourceSetProjectMap(rootProject: Project): Map[SourceSet, Project] = {
-    rootProject.getAllprojects.asScala
+    getAllBloopCapableProjects(rootProject)
       .flatMap(p => p.allSourceSets.map(_ -> p))
       .toMap
   }
@@ -381,10 +389,9 @@ class BloopConverter(parameters: BloopParameters) {
         val archiveTasks = c.getAllArtifacts.asScala.flatMap(getArchiveTask)
         val possibleArchiveSourceSets =
           archiveTasks
-            .flatMap(
-              archiveTask =>
-                getSourceSet(sourceSets, archiveTask)
-                  .map(ss => archiveTask.getArchivePath -> ss)
+            .flatMap(archiveTask =>
+              getSourceSet(sourceSets, archiveTask)
+                .map(ss => archiveTask.getArchivePath -> ss)
             )
             .toMap
         possibleArchiveSourceSets
@@ -452,25 +459,63 @@ class BloopConverter(parameters: BloopParameters) {
     testTask.map(_ => Config.Test.defaultConfiguration)
   }
 
-  def getProjectName(project: Project, sourceSet: SourceSet): String = {
-    val projectsWithName = project.getRootProject
-      .getAllprojects()
-      .asScala
-      .filter(p => p.getName == project.getName)
-    val rawProjectName = if (projectsWithName.size == 1) project.getName else project.getPath
-    val sanitizedProjectName = rawProjectName.zipWithIndex
-      .map {
-        case (c, i) =>
-          if (i == 0 && c == ':') {
-            None
-          } else if (c == ':') {
-            Some('-')
-          } else {
-            Some(c)
-          }
+  // create a minimal unique project name
+  // e.g. if "Foo" exists twice with paths...
+  // "a:b:c:Foo" and "a:b:d:Foo"
+  // then names should be
+  // "c-Foo" and "d-Foo"
+  // not
+  // "a-b-c-Foo" and "a-b-d-Foo"
+  private def createUniqueProjectName(project: Project): String = {
+
+    def getFQName(project: Project): String = {
+      // gradle getPath is inconsistent - it returns ":" for rootProject and doesn't preface non-root project with rootProject.name
+      if (project == project.getRootProject())
+        project.getName
+      else
+        s"${project.getRootProject().getName}${project.getPath()}"
+    }
+
+    def getReversedFQNameParts(project: Project): Array[String] = {
+      getFQName(project).split(':').reverse
+    }
+
+    @tailrec
+    def getUniqueSections(
+        idx: Int,
+        fqNameParts: Array[String],
+        fqNamesParts: List[Array[String]]
+    ): Array[String] = {
+      if (idx >= fqNameParts.length)
+        fqNameParts
+      else {
+        val partialName = fqNameParts.take(idx)
+        val partialNames = fqNamesParts.map(_.take(idx))
+        if (!partialNames.exists(_.sameElements(partialName)))
+          partialName
+        else
+          getUniqueSections(idx + 1, fqNameParts, fqNamesParts)
       }
-      .flatten
-      .mkString
+    }
+
+    // Need to namespace only those projects that can run bloop. Others would not cause collision.
+    val projectsWithSameName =
+      getAllBloopCapableProjects(project.getRootProject())
+        .filter(_.getName == project.getName)
+
+    if (projectsWithSameName.size == 1) project.getName
+    else {
+      val fqNameParts = getReversedFQNameParts(project)
+      val fqNamesParts =
+        projectsWithSameName.map(getReversedFQNameParts).filter(!_.sameElements(fqNameParts))
+      getUniqueSections(1, fqNameParts, fqNamesParts).reverse.mkString("-")
+    }
+  }
+
+  def getProjectName(project: Project, sourceSet: SourceSet): String = {
+    // If there are more than one project with same name, use path to avoid collision.
+    val sanitizedProjectName = createUniqueProjectName(project)
+
     if (sourceSet.getName == SourceSet.MAIN_SOURCE_SET_NAME) {
       sanitizedProjectName
     } else {
@@ -693,7 +738,7 @@ class BloopConverter(parameters: BloopParameters) {
       .includeSourceFiles(false)
       .includeLauncherOptions(false)
 
-    var args = builder.build().asScala.toList.filter(_.nonEmpty)
+    var args = builder.build().asScala.toList
 
     if (!args.contains("-source")) {
       if (specs.getSourceCompatibility != null) {
@@ -784,6 +829,10 @@ class BloopConverter(parameters: BloopParameters) {
 
   private def splitFlags(values: List[String]): List[String] = {
     values.flatMap(value => value.split(argumentSpaceSeparator))
+  }
+
+  private def getAllBloopCapableProjects(rootProject: Project): List[Project] = {
+    rootProject.getAllprojects().asScala.filter(PluginUtils.canRunBloop).toList
   }
 }
 
